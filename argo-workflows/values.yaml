@@ -1,0 +1,15 @@
+workflow:
+  serviceAccount:
+    create: true
+    name: "argo-workflow"
+  rbac:
+    create: true
+controller:
+  workflowNamespaces:
+    - default
+    # - test
+    # - test2
+
+server:
+  extraArgs:
+    - --auth-mode=server
