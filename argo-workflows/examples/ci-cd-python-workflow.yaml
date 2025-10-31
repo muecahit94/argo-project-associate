@@ -1,0 +1,65 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Workflow
+metadata:
+  generateName: python-app-
+  namespace: argo
+spec:
+    serviceAccountName: argo-workflow
+    entrypoint: python-app
+    templates:
+      - name: python-app
+        steps:
+          - - name: build
+              template: build
+          - - name: test
+              template: test
+          # - - name: build-and-push
+          #     template: build-and-push
+          - - name: deploy
+              template: deploy
+      - name: build
+        container:
+          image: python:3.11
+          command: [python]
+          args: ["-c", "print('build')"]
+      - name: test
+        container:
+          image: python:3.11
+          command: [python]
+          args: ["-m", "unittest"]
+          volumeMounts:
+            - name: test-volume
+              mountPath: /app/tests
+        volumes:
+          - name: test-volume
+            hostPath:
+              path: /path/to/tests
+      # - name: build-and-push
+      #   container:
+      #     image: gcr.io/kaniko-project/executor:latest
+      #     command: ["/kaniko/executor"]
+      #     args:
+      #       - "--context=/workspace"
+      #       - "--dockerfile=/workspace/Dockerfile"
+      #       - "--destination=muecahit/python-app:{{workflow.creationTimestamp}}"
+      #       - "--destination=muecahit/python-app:latest"
+      #       - "--cache=true"
+      #     volumeMounts:
+      #       - name: kaniko-secret
+      #         mountPath: /kaniko/.docker/
+      #       - name: workspace
+      #         mountPath: /workspace
+      #   volumes:
+      #     - name: kaniko-secret
+      #       secret:
+      #         secretName: dockerhub-secret
+      #         items:
+      #           - key: config.json
+      #             path: config.json
+      #     - name: workspace
+      #       emptyDir: {}
+      - name: deploy
+        container:
+          image: python:3.11
+          command: [python]
+          args: ["-c", "print('deploy')"]
