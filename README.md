@@ -954,6 +954,476 @@ In summary, deployment strategies are fundamental in modern software development
 ---
 
 
+## Argo Rollouts Architecture and Core Components
+
+![Argo Rollouts architecture](images/image-08.png)
+
+### Argo Rollouts Components
+
+- **Argo Rollouts Controller**  
+    An operator that manages Argo Rollout Resources. It reads all the details of a rollout (and other resources) and ensures the desired cluster state.
+
+- **Argo Rollout Resource**  
+    A custom Kubernetes resource managed by the Argo Rollouts Controller. It is largely compatible with the native Kubernetes Deployment resource, adding additional fields that manage the stages, thresholds, and techniques of sophisticated deployment strategies, including canary and blue-green deployments.
+
+- **Ingress**  
+    The Kubernetes Ingress resource is used to enable traffic management for various traffic providers such as service meshes (e.g., Istio or Linkerd) or Ingress Controllers (e.g., Nginx Ingress Controller).
+
+- **Service**  
+    Argo Rollouts utilizes the Kubernetes Service resource to redirect ingress traffic to the respective workload version by adding specific metadata to a Service.
+
+- **ReplicaSet**  
+    Standard Kubernetes ReplicaSet resource used by Argo Rollouts to keep track of different versions of an application deployment.
+
+- **AnalysisTemplate and AnalysisRun**  
+    Analysis is an optional feature of Argo Rollouts and enables the connection of Rollouts to a monitoring system. This allows automation of promotions and rollbacks. To perform an analysis an AnalysisTemplate defines a metric query and their expected result. If the query matches the expectation, a Rollout will progress or rollback automatically, if it doesn’t. An AnalysisRuns is an instantiation of an AnalysisTemplate (similar to Kubernetes Jobs).
+
+- **Metric Providers**  
+    Metric providers can be used to automate promotions or rollbacks of a rollout. Argo Rollouts provides native integration for popular metric providers such as Prometheus and other monitoring systems.
+
+> Please note, that not all of the mentioned components are mandatory to every Argo Rollouts setup. The usage of Analysis resources or metric providers is entirely optional and relevant for more advanced use cases.
+
+
+## A Refresher: The Kubernetes Replica Set
+
+To grasp the workings of Argo Rollouts in handling workloads, it's essential to understand some basics of Kubernetes. Essentially, Argo Rollouts functions in a manner quite similar to Kubernetes Deployment resources. What is less commonly known is that Deployments provide another layer of abstraction for workload management. The Deployment resource was a relatively later addition to Kubernetes, debuting in version 1.5 as part of the `apps/v1beta1` API and achieving stability in version 1.9 with the `apps/v1` API. Before the introduction of Deployments, workload management was accomplished using ReplicaSets. And under the hood, they are used until today!
+
+A **Kubernetes ReplicaSet** is a resource used to ensure that a specified number of pod replicas are running at any given time. Essentially, it's a way to manage the lifecycle of pods. The main function of a ReplicaSet is to maintain a stable set of pod replicas running at any given time. It does so by scheduling pods as needed to reach the desired number.
+
+If a pod fails, the ReplicaSet will replace it; if there are more pods than needed, it will terminate the extra pods. ReplicaSets are used to achieve redundancy and high availability within Kubernetes applications.
+
+For more sophisticated orchestration like rolling updates, rollbacks or scaling, a ReplicaSet is not enough. Kubernetes introduced a higher-level (and usually better known) concept called **Deployment** resource that manages both the deployment and updating of applications.
+
+A deployment is managed by the Kubernetes deployment controller and is responsible for updating ReplicaSets by providing declarative updates for them.
+
+Let's create a Deployment of nginx proxies to demonstrate the ownership between Deployment and ReplicaSet:
+
+```bash
+kubectl create deploy nginx-deployment --image=nginx --replicas=3
+```
+
+```
+deployment.apps/nginx-deployment created
+```
+
+Now make sure it properly scaled up:
+
+```bash
+kubectl get deployment
+```
+
+```
+NAME               READY   UP-TO-DATE   AVAILABLE   AGE
+nginx-deployment   3/3     3            3           47s
+```
+
+```bash
+kubectl get replicaset
+```
+
+```
+NAME                          DESIRED   CURRENT   READY   AGE
+nginx-deployment-66fb7f764c   3         3         3       47s
+```
+
+The ReplicaSet `nginx-deployment-66fb7f764c` is managed by `nginx-deployment`. You can tell this by inspecting the ReplicaSet:
+
+```bash
+kubectl get replicaset nginx-deployment-66fb7f764c -ojsonpath='{.metadata.ownerReferences}' | jq
+```
+
+```json
+[
+    {
+        "apiVersion": "apps/v1",
+        "blockOwnerDeletion": true,
+        "controller": true,
+        "kind": "Deployment",
+        "name": "nginx-deployment",
+        "uid": "1dd44efd-aab5-4475-aff2-32670201e2ef"
+    }
+]
+```
+
+As we see, the `ownerReferences` of the ReplicaSet state that this resource is “owned” by a Deployment resource with the uid `1dd44efd-aab5-4475-aff2-32670201e2ef`. And indeed, this uid matches with the other Deployment we just created:
+
+```bash
+kubectl get deployment nginx-deployment -ojsonpath='{.metadata.uid}'
+```
+
+```
+1dd44efd-aab5-4475-aff2-32670201e2ef
+```
+
+Deployments are a great invention of vanilla Kubernetes and are a successful abstraction. Rarely do people manage their pods manually through ReplicaSets. Deployments are the standard.
+
+But despite all the praise, Deployment resources are still limited in their capabilities. They still do not support all deployment strategies we described in the previous section, “A Primer on Progressive Delivery”.
+
+## Argo Rollouts
+
+Here, we will explore the **Argo Rollouts** resource, which is the central element in Argo Rollouts, enabling advanced deployment strategies. A **Rollout**, in essence, is a Kubernetes resource that closely mirrors the functionality of a Kubernetes Deployment object. However, it steps in as a more advanced substitute for Deployment objects, particularly in scenarios demanding intricate deployment of progressive delivery techniques.
+
+> Argo Rollouts outshine regular Kubernetes Deployments with several enhanced features
+
+### Argo Rollouts Functionalities
+
+- **Blue-green deployments:**  
+    This approach minimizes downtime and risk by switching traffic between two versions of the application.
+
+- **Canary deployments:**  
+    Gradually roll out changes to a subset of users to ensure stability before full deployment.
+
+- **Advanced traffic routing:**  
+    Integrates seamlessly with ingress controllers and service meshes, facilitating sophisticated traffic management.
+
+- **Integration with metric providers:**  
+    Offers analytical insights for blue-green and canary deployments, enabling informed decisions.
+
+- **Automated decision making:**  
+    Automatically promote or roll back deployments based on the success or failure of defined metrics.
+
+The **Rollout** resource is a custom Kubernetes resource introduced and managed by the Argo Rollouts Controller. This Kubernetes controller monitors resources of type Rollout and ensures that the described state will be reflected in the cluster.
+
+The Rollout resource maintains high compatibility with the conventional Kubernetes Deployment resource but is augmented with additional fields. These fields are instrumental in governing the phases, thresholds, and methodologies of advanced deployment approaches, such as canary and blue-green strategies.
+
+It’s crucial to understand that the Argo Rollouts controller is attuned exclusively to changes in Rollout resources. It remains inactive for standard deployment resources. Consequently, to use the Argo Rollouts for existing Deployments, a migration from traditional Deployments to Rollouts is required.
+
+Overall, Deployment and Rollout resources look pretty similar. Refer to the following table to understand the minimal differences between both.
+
+
+
+| **DEPLOYMENT RESOURCE** | **ARGO ROLLOUT RESOURCE** | **COMMENT** |
+|--------------------------|----------------------------|--------------|
+| `apiVersion: apps/v1`<br>`kind: Deployment`<br>`metadata:`<br>&nbsp;&nbsp;`name: nginx-deployment` | `apiVersion: argoproj.io/v1alpha1`<br>`kind: Rollout`<br>`metadata:`<br>&nbsp;&nbsp;`name: nginx-rollout` | Basic resource metadata. |
+| `replicas: 3` | `replicas: 3` | Number of desired pods. Defaults to 1. |
+| `selector:`<br>&nbsp;&nbsp;`matchLabels:`<br>&nbsp;&nbsp;&nbsp;&nbsp;`app: nginx` | `selector:`<br>&nbsp;&nbsp;`matchLabels:`<br>&nbsp;&nbsp;&nbsp;&nbsp;`app: nginx` | Label selector for pods. |
+| `template:`<br>&nbsp;&nbsp;`metadata:`<br>&nbsp;&nbsp;&nbsp;&nbsp;`labels:`<br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;`app: nginx`<br>&nbsp;&nbsp;`spec:`<br>&nbsp;&nbsp;&nbsp;&nbsp;`containers:`<br>&nbsp;&nbsp;&nbsp;&nbsp;- `name: nginx`<br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;`image: nginx` | `template:`<br>&nbsp;&nbsp;`metadata:`<br>&nbsp;&nbsp;&nbsp;&nbsp;`labels:`<br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;`app: nginx`<br>&nbsp;&nbsp;`spec:`<br>&nbsp;&nbsp;&nbsp;&nbsp;`containers:`<br>&nbsp;&nbsp;&nbsp;&nbsp;- `name: nginx`<br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;`image: nginx` | Describes the pod template that will be used to instantiate pods. The template does not differ. |
+| `strategy:`<br>&nbsp;&nbsp;`type: RollingUpdate` | `strategy:`<br>&nbsp;&nbsp;`blueGreen: {}` | A Deployment strategy can be either “RollingUpdate” (default) or “Recreate”.<br>A Rollout strategy can either be “blueGreen” or “canary”. |
+
+Of course, there are way more configuration options to control the behavior of a Rollout. Please refer to the [official Argo Rollouts specification](https://argoproj.github.io/argo-rollouts/features/specification/) for more options.
+
+
+### Migrating Existing Deployments to Rollouts
+
+The similarity of Deployments and Rollouts spec makes it easier to convert from one to the other resource type. Argo Rollouts supports a great way to migrate existing Deployment resources to Rollouts.
+
+By providing a `spec.workloadRef` instead of `spec.template`, a Rollout can refer to a Deployment's template:
+
+```yaml
+apiVersion: argoproj.io/v1alpha1
+kind: Rollout
+metadata:
+    name: nginx-rollout
+spec:
+    replicas: 3
+    selector:
+        matchLabels:
+            app: nginx
+    workloadRef:
+        apiVersion: apps/v1
+        kind: Deployment
+        name: nginx-deployment
+[...]
+```
+
+The Rollout will fetch the template information from the Deployment (in our example named `nginx-deployment`) and start the number of pods specified in the Rollout.
+
+> **Note:** Lifecycles of Deployment and Rollouts are distinct and managed by their respective controllers. This means that the Kubernetes Deployment controller will not start to manage Pods created by the Rollout. Also, the Rollout will not start to manage pods that are controlled by the Deployment.
+
+This enables a zero-downtime introduction of Argo Rollouts to your existing cluster. It furthermore makes experimentation with multiple deployment scenarios possible.
+
+
+### Discussion: Create Rollouts or Reference Deployments from Rollouts?
+
+As Rollout resources can exist and operate without vanilla Deployments, the following question might arise: **Should I always reference Deployments or is it better to start over with an independent Rollout resource, without the dependency of a reference?**
+
+And the simple answer to it is… **it depends**.
+
+Generally, `workloadRef` has been invented to enable a simple and seamless way of migrating from Deployments to Rollouts. We even consider it useful as Administrators who are unfamiliar with Argo Rollouts might be confused if they see an array of Pods running but neither a running Deployment nor StatefulSet. To lower the barrier, referencing existing Deployments from a Rollout can be a good option.
+
+If you use Deployment referencing, the Argo controller will copy the generation number of the referenced Deployment and stores it in a status field called `workloadObservedGeneration`. Therefore the rollout's own `rollout.argoproj.io/workload-generation` annotation should always match the generation of the deployment. This helps to identify deviation due to manipulation of either of the resources.
+
+However, referencing comes at the cost of another resource dependency. Yet another resource to check in case of failure!
+
+So, if you are sure you want to work with Argo Rollouts, use the native Rollout Resource.
+
+> **Hint:**  
+> It is also possible to migrate a Rollout resource to a native Deployment. Please refer to the [official documentation](https://argoproj.github.io/argo-rollouts/migrating/#convert-rollout-to-deployment) for further information.
+
+**Additional learning resources:**
+
+- To explore the detailed specification of a Rollout, visit [Argo Rollouts Specification](https://argoproj.github.io/argo-rollouts/features/specification/).
+- For guidance on transitioning from a Deployment to a Rollout, consult [Migrating a Deployment to Rollout](https://argoproj.github.io/argo-rollouts/migrating/).
+
+
+### Ingress and Service Resources
+
+While the Argo Rollouts Controller and the corresponding Rollout resource are the core components, there are further building blocks that enable and extend the functionality of Argo Rollouts.
+
+#### Relevant Resources for Traffic Routing
+
+**Kubernetes Ingress**  
+A Kubernetes Ingress is a native resource that manages external access to services in a cluster (typically via HTTP). Ingress allows you to define rules for inbound connections to reach cluster-internal Kubernetes Services. It is an important abstraction for programmatically controlling the flow of incoming network traffic and can be used for SSL/TLS termination.
+
+**Kubernetes Service**  
+A Kubernetes Service abstracts how to expose an application running on a set of Pods. Services load-balance traffic and provide service discovery within the cluster. The primary role of a Service is to provide a consistent IP address and port number for accessing the running application, regardless of changes in the pods.
+
+In the context of Argo Rollouts, these resources play a pivotal role, especially for canary deployments. The general behavior of Service and Ingress resources is no different when used with Argo. Argo Rollouts uses Kubernetes Services to manage traffic flow to different versions of an application during a rollout process by augmenting the service with additional metadata.
+
+**Pod Template Hash**  
+Argo Rollouts utilizes the Pod Template Hash, which uniquely identifies Pods of a common ReplicaSet. To switch incoming traffic from the “old” ReplicaSet to the new ReplicaSet, the Argo Rollouts controller mutates the Service `spec.selector` to match the new Pod Template Hash.
+
+![alt text](images/image-09.png)
+
+Kubernetes Services have selectors that find matching pods according to their label set; the `pod-template-hash` label is added to every ReplicaSet and used to make routing decisions.
+
+**Stable/Canary ReplicaSets**  
+By introducing a “stable service” and “canary services” in the Rollouts Spec, Argo can not only switch the traffic to Stable/Canary ReplicaSets, but also decide about the distribution of which ReplicaSet should receive how much traffic.
+
+
+### Rollout Analysis
+
+The ability to split traffic between stable and canary workloads is good. But how do we decide if the canary workload is performing well and is therefore considered "stable"? That's right, metrics! An operator would closely observe the monitoring system (e.g., Prometheus, VMWare Wavefront or others) for certain metrics that indicate the application is working well. If you're thinking that this "observing metrics and making a decision" could be automated, you're right!
+
+Argo Rollouts allows the user to run **Analysis** during the progressive delivery process. It primarily focuses on evaluating and ensuring the success of deployment based on defined criteria. These criteria can include custom metrics of your specific metric monitoring provider (see the [official documentation](https://argo-rollouts.readthedocs.io/en/stable/features/analysis/) for a conclusive list of supported metric providers).
+
+The analysis process in Argo Rollouts involves the following custom resources that work hand in hand with the already discussed resources:
+
+#### Analysis Custom Resource Definitions
+| **TEMPLATES**             | **DESCRIPTION/USE CASE** |
+|---------------------------|--------------------------|
+| **AnalysisTemplate**      | This template defines the metrics to be queried and the conditions for success or failure. The AnalysisTemplate specifies what metrics should be monitored and the thresholds for determining the success or failure of a deployment. It can be parameterized with input values to make it more dynamic and adaptable to different situations. |
+| **ClusterAnalysisTemplate** | A ClusterAnalysisTemplate is like an AnalysisTemplate, but it is not limited to its namespace. It can be used by any Rollout throughout the cluster. |
+| **AnalysisRun**           | An AnalysisRun is an instantiation of an AnalysisTemplate. It is a Kubernetes resource that behaves similarly to a job in that it runs to completion. The outcome of an AnalysisRun can be successful, failed, or inconclusive, and this result directly impacts the progression of the Rollout's update. If the AnalysisRun is successful, the update continues; if it fails, the update is aborted; and if it's inconclusive, the update is paused. |
+
+
+
+
+Analysis resources allow Argo Rollouts to make informed decisions during the deployment process, like promoting a new version, rolling back to a previous version, or pausing the rollout for further investigation based on real-time data and predefined success criteria.
+
+AnalysisRuns support various providers like Prometheus or multiple other monitoring solutions to obtain measurements for analysis. Those measurements can then be used to automate promotion decisions.
+
+Besides just looking at metrics, there are other ways to decide if your rollout is doing well. The most basic (but commonly used) one might be the [Kubernetes “Job”](https://argo-rollouts.readthedocs.io/en/stable/analysis/job/) provider: if a job is successful, the metric is considered “successful". If the job returns with anything else than return code zero, the metric is considered “failed”.
+
+The [Web provider](https://argo-rollouts.readthedocs.io/en/stable/analysis/web/) helps with seamless integration to custom services to help make promotion decisions.
+
+Remember, it's not mandatory to use analysis and metrics when you're rolling out updates in Argo Rollouts.
+
+If you want, you can control the rollout yourself. This means you can stop or advance the rollout whenever you choose. You can do this through the API or the command line. Also, you don't have to rely on automatic metrics for using Argo Rollouts. It's totally fine to combine automatic steps, like those based on analysis, with your own manual steps.
+
+
+### Rollout Experiments
+
+Experiments are an extended feature of Argo Rollouts designed to test and evaluate changes in two or more versions of an application in a controlled, temporary environment. The Experiment custom resource can launch AnalysisRuns alongside ReplicaSets. This is useful to confirm that new ReplicaSets are running as expected.
+
+You can use experiments in Argo Rollouts to test different versions of your app at the same time. This is like doing A/B/C testing. You can set up each experiment with its own version of the app to see which one works best. Each experiment uses a template to define its specific version of the app.
+
+The great thing about these experiments is that you can run several of them simultaneously, and each one is separate from the others. This means they don't interfere with each other.
+
+To learn more about [Analysis](https://argo-rollouts.readthedocs.io/en/stable/features/analysis/) or [Experiments](https://argoproj.github.io/argo-rollouts/features/experiment/), please consult the official documentation.
+
+
+## Practical
+
+### Install Argo Rollouts
+
+```bash
+kubectl create namespace argo-rollouts
+kubectl apply -n argo-rollouts -f https://github.com/argoproj/argo-rollouts/releases/download/v1.6.4/install.yaml
+```
+
+### Install Argo Rollouts CLI
+
+```bash
+brew install argoproj/tap/kubectl-argo-rollouts
+kubectl argo rollouts version
+
+# Optional, bash completion
+source <(kubectl-argo-rollouts completion zsh)
+```
+
+### Access Argo Rollouts Dashboard
+
+```bash
+kubectl argo rollouts dashboard
+```
+
+Then open [http://localhost:3100](http://localhost:3100) in your browser.
+
+### Example commands
+
+```bash
+kubectl get rollout
+kubectl argo rollouts get rollout <rollout-name>
+kubectl argo rollouts promote <rollout-name>
+kubectl argo rollouts undo <rollout-name>
+```
+
+
+### Practical Blue-Green Rollout
+
+In this example, we'll deploy two services—`rollout-bluegreen-active` and `rollout-bluegreen-preview` using a **blue-green** strategy with Argo Rollouts. This approach allows you to run both the current ("active") and new ("preview") versions of your application simultaneously, ensuring zero-downtime deployments and easy rollbacks.
+
+**How it works:**
+
+- The **active service** (`rollout-bluegreen-active`) routes production traffic to the stable version.
+- The **preview service** (`rollout-bluegreen-preview`) exposes the new version for validation and testing.
+- Once validated, traffic is switched from the active to the preview service, promoting the new version to production.
+
+> Blue-green deployments minimize downtime and risk, making them ideal for critical production releases.
+
+**Steps:**
+
+1. **Apply the Blue(v1) Rollout and Service Manifest:**
+    ```bash
+    kubectl apply -f argo-rollouts/examples/blue-green/rollout-blue.yaml
+    kubectl apply -f argo-rollouts/examples/blue-green/services.yaml
+
+    ```
+
+2. **Verify the Rollout Resource:**
+    ```bash
+    kubectl get rollout
+    kubectl argo rollouts get rollout rollout-bluegreen
+    ```
+
+3. **Access the Argo Rollouts Dashboard (optional):**
+    ```bash
+    kubectl argo rollouts dashboard
+    ```
+    Open [http://localhost:3100](http://localhost:3100) in your browser to visualize rollout progress.
+
+4. **Perform update**
+    
+    Now we will deploy the green (v2):
+
+    ```bash
+    kubectl apply -f argo-rollouts/examples/blue-green/rollout-green.yaml
+    ```
+
+    The Rollout status moves from **Healthy** to **Paused**, indicating that a rollout is in progress and waits for further action.
+
+    > **Note:**  
+    > We explicitly set `autoPromotionEnabled` to `false`. You can skip the pausing phase and directly promote by setting this value to `true`.
+
+5. **Promote the New Version**
+
+    To promote the new (green) version to production, run:
+
+    ```bash
+    kubectl argo rollouts promote rollout-bluegreen
+    kubectl argo rollouts get ro rollout-bluegreen
+    ```
+
+    After promotion, the new revision transitions from **preview** to **stable, active**, indicating it is now serving live traffic.
+
+    You can verify which version is active by inspecting the service:
+
+    ```bash
+    kubectl describe svc rollout-bluegreen-active
+    ```
+
+
+6. **Perform a Rollback**
+
+    Suppose you need to roll back from the new (green) version to the previous (blue) version. Use the following commands:
+
+    ```bash
+    kubectl argo rollouts undo rollout-bluegreen
+    ```
+
+    Check the rollout status:
+
+    ```bash
+    kubectl argo rollouts get ro rollout-bluegreen
+    ```
+
+    > Note: The "undo" command alone does not immediately activate the blue image. The rollout enters a paused state, awaiting promotion.
+
+    To finalize the rollback and promote the blue version:
+
+    ```bash
+    kubectl argo rollouts promote rollout-bluegreen
+    ```
+
+    Verify that the active service selector now points to the previous ReplicaSet:
+
+    ```bash
+    kubectl argo rollouts get ro rollout-bluegreen
+    ```
+
+### Practical Migration
+Migrating an Existing Deployment to Argo Rollouts
+
+1. **Preparing Deployment**
+
+For this lab, we will create an NGINX deployment—a task you may have already undertaken numerous times:
+
+```bash
+kubectl create deploy nginx-deployment --image=nginx --replicas=3
+kubectl get po,deploy
+```
+
+2. **Convert Deployment to Rollout**
+
+Now, let's reference the existing Deployment in a new Rollout resource. Create the following file: `argo-rollouts/examples/migration/rollout.yaml`.
+
+Notice the `workloadRef` field, which points to the `nginx-deployment` resource:
+
+```yaml
+apiVersion: argoproj.io/v1alpha1
+kind: Rollout
+metadata:
+    name: nginx-rollout
+spec:
+    replicas: 3
+    selector:
+        matchLabels:
+            app: nginx
+    workloadRef:
+        apiVersion: apps/v1
+        kind: Deployment
+        name: nginx-deployment
+```
+
+Apply the Rollout manifest:
+
+```bash
+kubectl apply -f argo-rollouts/examples/migration/rollout.yaml
+```
+
+After applying, you will have 6 nginx pods running—3 managed by the original Deployment and 3 by the new Rollout:
+
+```bash
+kubectl get ro,deploy,po
+```
+
+
+3. **Scale Down Deployment**
+
+To complete the migration, manually scale down the deployment:
+
+```bash
+kubectl scale deployment/nginx-deployment --replicas=0
+```
+
+Congratulations! Your workload is now managed by a Rollout resource.
+
+> **Note:**  
+> In future versions of Argo Rollouts, scaling down the referenced deployment will be handled automatically by the controller via a `scaleDown` parameter. This will allow administrators to specify how the deployment should be scaled down (`never`, `onsuccess`, or `progressively`).  
+> This course covers Argo Rollouts v1.6.4, but this upcoming feature is worth mentioning for future migrations.
+
+
+4. **Clean Up Resources**
+
+Make sure to leave the cluster nice and clean:
+
+```bash
+kubectl delete rollout nginx-rollout
+kubectl delete deployment nginx-deployment
+```
+
+
 
 
 # Argo Events
@@ -968,5 +1438,195 @@ Argo Events is a Kubernetes-native framework for building event-driven automatio
 Argo Events makes it easy to automate Kubernetes workflows based on real-world events.
 
 
+## Event-Driven Architecture
+
+In this section, we explore the concept of event-driven architecture (EDA) and its practical application in Kubernetes environments. Unlike traditional architectures where components operate in a linear, request-response manner, EDA is based on a more dynamic and fluid model. This model is particularly relevant in Kubernetes, a system that manages containerized applications across clusters and thrives on responsiveness and adaptability.
+
+At the core of Kubernetes are events — these are various actions or changes within the system, like pod lifecycle changes or service updates. EDA in Kubernetes involves responding to these events in a way that's both automated and scalable. This method of operation allows for a more efficient handling of the ever-changing state within a Kubernetes cluster.
+
+Argo Events enters the picture as a tool designed for Kubernetes, aimed at facilitating the implementation of event-driven paradigms. It isn't just an add-on but rather an integration that amplifies Kubernetes' capabilities. The main components of Argo Events are:
+
+- **[Event Source](https://argoproj.github.io/argo-events/concepts/event_source/):**  
+    This is where events are generated. Event sources in Argo Events can be anything from a simple webhook or a message from a message queue, to a scheduled event. Understanding event sources is key to knowing how your system will interact with various external and internal stimuli.
+
+- **[Sensor](https://argoproj.github.io/argo-events/concepts/sensor/):**  
+    Sensors are the event listeners in Argo Events. They wait for specific events from the event sources and, upon detecting these events, trigger predefined actions. Understanding sensors involves knowing how to respond to different types of events.
+
+- **[EventBus](https://argoproj.github.io/argo-events/concepts/eventbus/):**  
+    The EventBus acts as a backbone for event distribution within Argo Events. It's responsible for managing the delivery of events from sources to sensors. Understanding the EventBus is crucial for managing the flow of events within your system.
+
+- **[Trigger](https://argoproj.github.io/argo-events/concepts/trigger/):**  
+    Triggers in Argo Events are the mechanisms that respond to events detected by sensors. They can perform a wide range of actions, from starting a workflow to updating a resource. Understanding triggers is essential for automating responses to events.
+
+![argo-events](images/image-10.png)
+
+### Architecture of Argo Events
+
+The image below depicts the architecture of Argo Events, showing three main components: **Event Source**, **Event Bus**, and **Sensor**, each with a controller and deployment.
+
+- The **Event Source** receives various events (like SNS, SQS, GCP PubSub, S3, Webhooks, etc.), which are managed by the Event Source Controller and passed on to the Event Source Deployment.
+- This connects to the **Event Bus** with NATS Streaming through the Event Bus Controller.
+- Finally, the **Sensor Controller** manages the Sensor Deployment, which triggers workflows in Kubernetes and functions in AWS Lambda, illustrated by respective icons.
 
 
+## Practical
+
+### 1. Installing Argo Workflows
+```bash
+helm repo add argo https://argoproj.github.io/argo-helm
+helm repo update
+helm upgrade -i argo-workflows argo/argo-workflows -n argo --create-namespace -f argo-workflows/values.yaml
+```
+
+To access the Argo Workflows UI, forward the server port:
+
+```bash
+kubectl -n argo port-forward deployment/argo-workflows-server 2746:2746
+```
+
+### 2. Installing Argo Events
+```bash
+kubectl create namespace argo-events
+kubectl apply -f https://raw.githubusercontent.com/argoproj/argo-events/stable/manifests/install.yaml
+```
+
+### Setting Up Event Triggers with Argo
+The next command applies a validating webhook for Argo Events. Validating webhooks are
+used to ensure that incoming requests to the Kubernetes API server are valid:
+
+```bash
+kubectl apply -f https://raw.githubusercontent.com/argoproj/argo-events/stable/manifests/install-validating-webhook.yaml
+```
+
+For setting up a native EventBus in the 'argo-events' namespace, which handles event
+transportation in Argo Events, apply the configuration with this command:
+
+```bash
+kubectl -n argo-events apply -f https://raw.githubusercontent.com/argoproj/argo-events/stable/examples/eventbus/native.yaml
+```
+
+Next we need to define an EventSource configuration that listens for webhook events in Argo
+Events, apply the following configuration using this command:
+
+```bash
+kubectl -n argo-events apply -f https://raw.githubusercontent.com/argoproj/argo-events/stable/examples/event-sources/webhook.yaml
+```
+
+For the Sensor to properly interact with Kubernetes resources, apply the necessary RBAC
+policies:
+
+```bash
+kubectl apply -n argo-events -f https://raw.githubusercontent.com/argoproj/argo-events/master/examples/rbac/sensor-rbac.yaml
+```
+
+Similarly, apply RBAC policies for Workflows to ensure they have the necessary permissions in
+Kubernetes:
+
+```bash
+kubectl apply -n argo-events -f https://raw.githubusercontent.com/argoproj/argo-events/master/examples/rbac/workflow-rbac.yaml
+```
+
+Set up a Sensor to trigger workflows based on webhook events by applying this Sensor
+configuration:
+
+```bash
+kubectl -n argo-events apply -f https://raw.githubusercontent.com/argoproj/argo-events/stable/examples/sensors/webhook.yaml
+```
+
+Expose the event-source pod via port forwarding to consume requests over HTTP:
+
+```bash
+kubectl -n argo-events port-forward $(kubectl -n argo-events get pod -l eventsource-name=webhook -o name) 12000:12000 &
+```
+
+Finally, simulate an external event that triggers the workflow. Send a test webhook event to the
+Event Source with this curl command:
+
+```bash
+curl -d '{"message":"this is my first webhook"}' -H "Content-Type: application/json" -X POST http://localhost:12000/example
+```
+
+Refresh the UI of Argo Workflows. You should see a new workflow that is processing.
+
+Refresh again after a few minutes and you should see the completed workflow.
+
+Click on the name of the workflow (e.g., webhook-rf66b). In the new window select the webhook, 
+select Inputs/Outputs and under parameters you see the message of the curl we have sent before.
+
+
+### Practical: Integrating Argo Events with External Systems
+
+**Use Apache Pulsar with Argo Events**
+
+---
+
+#### 1. Triggering a Workflow with Pulsar
+
+Deploy Apache Pulsar in your cluster with:
+
+```bash
+kubectl -n argo-events apply -f https://raw.githubusercontent.com/lftraining/LFS256-code/main/argoevents/pulsar.yaml
+```
+
+Check the status of the Pulsar pod and note the name:
+
+```bash
+kubectl get pods -n argo-events
+```
+
+Next, we need to port forward the Pulsar pod to enable direct communication between your
+local machine and the Pulsar service running in the Kubernetes cluster. This step is crucial for
+Argo Events to interact with Pulsar for triggering workflows. We do that with the following
+command:
+
+```bash
+NAME_OF_PULSAR_POD=$(kubectl -n argo-events get pods -l app=pulsar -o jsonpath='{.items[0].metadata.name}')
+kubectl -n argo-events port-forward $NAME_OF_PULSAR_POD 6650:6650
+```
+
+Set up the event source for Argo Events to listen to Pulsar messages. This configures Argo
+Events to connect and listen to Pulsar:
+
+```bash
+kubectl -n argo-events apply -f https://raw.githubusercontent.com/argoproj/argo-events/stable/examples/event-sources/pulsar.yaml
+```
+
+Deploy the sensor for reacting to Pulsar events. This sets up the actions to be taken in response
+to events detected by Argo Events:
+
+```bash
+kubectl -n argo-events apply -f https://raw.githubusercontent.com/argoproj/argo-events/stable/examples/sensors/pulsar.yaml
+```
+
+Now, everything is set up to trigger the event. To interact with the Pulsar pod, use:
+
+```bash
+kubectl -n argo-events exec -it $NAME_OF_PULSAR_POD -- /bin/bash
+```
+
+Inside the Pulsar pod, navigate to the bin directory and send a test message:
+
+```bash
+cd bin
+./pulsar-client produce test --messages "Test"
+```
+
+---
+
+#### 2. Inspecting the Triggered Workflow
+
+After sending the "Test" message via Pulsar, it triggers an Argo workflow. In the Argo UI, you
+can see the message in the workflow the same as in the first lab.
+
+However, this message is encoded in Base64, a common practice in Apache Pulsar for efficient
+and reliable data serialization and transmission. To read the message correctly, you'll need to
+decode it from Base64.
+
+```bash
+echo VGVzdA== | base64 -d
+```
+
+In this lab, we focused on the integration of Argo Events with Apache Pulsar, demonstrating how
+Argo Events can be configured to interact with external messaging systems. This exercise
+highlights Argo Events' versatility in integrating with different external systems, enhancing its
+capability to manage complex, event-driven architectures in cloud-native environments.
