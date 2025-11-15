@@ -41,6 +41,11 @@ helm repo update
 helm upgrade -i argo-workflows argo/argo-workflows -n argo --create-namespace -f argo-workflows/values.yaml
 ```
 
+To access the Argo Workflows UI, forward the server port:
+```bash
+kubectl -n argo port-forward deployment/argo-workflows-server 2746:2746
+```
+
 
 ## Install argo cli
 ```bash
