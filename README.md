@@ -1,4 +1,4 @@
-## Table of Contents
+# Table of Contents
 
 - [Certified ARGO Project Associate (CAPA)](#certified-argo-project-associate-capa)
 - [Argo Continuous Delivery (ArgoCD)](#argo-continuous-delivery-argocd)
